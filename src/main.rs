@@ -38,16 +38,21 @@ fn main() -> ! {
     // Create a serial interface to allow us to debug stuff to the computer in debug mode
     debug::init(arduino_hal::default_serial!(dp, pins, 57600));
 
+    // Get the ports we will be using for the soft limits
+    let soft_lower = pins.d4.into_floating_input();
+    let soft_upper = pins.d5.into_floating_input();
+
     // The state variables representing tagets etc. Much of this should be stored to and
     // reloaded from eeperom
     let mut state = State::Manual;
     let mut current_pos = 0 as i32; // The current position represented in steps
     let mut target_pos = current_pos; // The target position represented in steps
-    let mut target_vel = 0 as i32;
-    let mut oscilating_vel = BASE_SPEED;
-    let mut saved_pos = 0 as i32;
-    let mut end_points = (0 as i32, 1024 as i32); // (lower, upper) end-point for oscillaion in steps
-    let mut last_event_shift = false;
+    let mut target_vel = Some(0 as i32); // If we instead are in target velocity mode
+    let mut oscilating_vel = BASE_SPEED; // The velocity with which we move up and down
+    let mut saved_pos = 0 as i32; // Where we have our saved position
+    let mut end_points = (0 as i32, 25 * STEP_PER_MM); // (lower, upper) end-point for oscillaion in steps
+    let mut last_event_shift = false; // If the last button interaction was a option click
+    let mut last_was_lower = false; // I flast cycle was hitting the lower soft limit
 
     // Initiate the timer, including enabling interrupts
     timer::init_millis(dp.TC0);
@@ -98,7 +103,7 @@ fn main() -> ! {
         // figured out a good design for that yet
         let last_shift = last_event_shift;
         last_event_shift = false;
-        target_vel = 0;
+        target_vel = None;
         for e in btns.run(now) {
             match e {
                 ButtonEvent::Click { btn, mods } => {
@@ -132,7 +137,7 @@ fn main() -> ! {
                                         }
                                     }
                                 }
-                                State::Oscillating => {
+                                State::Oscillating(_) => {
                                     if mods.pressed(BTN_START_STOP) {
                                         // Increase the oscilating velocity with 1mm/s
                                         oscilating_vel =
@@ -176,7 +181,7 @@ fn main() -> ! {
                                         }
                                     }
                                 }
-                                State::Oscillating => {
+                                State::Oscillating(_) => {
                                     if mods.pressed(BTN_START_STOP) {
                                         // Decrease the oscilating velocity
                                         oscilating_vel =
@@ -201,9 +206,9 @@ fn main() -> ! {
                             state = match state {
                                 State::Manual => {
                                     debug::debug("start osc.", "");
-                                    State::Oscillating
+                                    State::Oscillating(Direction::Down)
                                 }
-                                State::Oscillating => {
+                                State::Oscillating(_) => {
                                     debug::debug("start osc.", "");
                                     State::Manual
                                 }
@@ -220,19 +225,19 @@ fn main() -> ! {
                         b => debug::debug("unknown button click: ", b),
                     }
                 }
-                ButtonEvent::Press { btn, millis, mods } => match *btn {
+                ButtonEvent::Press { btn, .. } => match *btn {
                     BTN_UP => match state {
                         State::Manual => {
-                            target_vel = MAX_SPEED;
+                            target_vel = Some(MAX_SPEED);
                         }
-                        State::Oscillating => {}
+                        State::Oscillating(_) => {}
                         State::Locked => continue 'outer,
                     },
                     BTN_DOWN => match state {
                         State::Manual => {
-                            target_vel = -MAX_SPEED;
+                            target_vel = Some(-MAX_SPEED);
                         }
-                        State::Oscillating => {}
+                        State::Oscillating(_) => {}
                         State::Locked => continue 'outer,
                     },
                     BTN_START_STOP => {}
@@ -242,10 +247,94 @@ fn main() -> ! {
             }
         }
 
+        // For Osciallaion we need to check if we are outside the bounds set, if so
+        // we should change direction
+        match state {
+            State::Oscillating(Direction::Up) => {
+                if current_pos >= end_points.1 {
+                    state = State::Oscillating(Direction::Down);
+                    debug::debug("will oscillate down", "");
+                }
+            }
+            State::Oscillating(Direction::Down) => {
+                if current_pos <= end_points.0 {
+                    state = State::Oscillating(Direction::Up);
+                    debug::debug("will oscillate up", "");
+                }
+            }
+            _ => {}
+        }
+
         // But regardless of what the user tells us we will listen to the soft
         // limit sensors and react to them - i.e. possibly overriding what the user
         // tells us to do
-        // Whenever we change here we must keep the invariants
+        let is_lower = soft_lower.is_high();
+        let is_upper = soft_upper.is_high();
+        if is_lower && is_upper {
+            debug::debug("error: both limits at once", "");
+            state = State::Locked;
+        }
+        if is_lower {
+            // We are currently at the lower limit, means that we should calibrate the
+            // position and prevent it from moving futher.
+            // One challange is that since we will be approaching this limit with different
+            // speeds it will take different amount of time before we reach 0 velocity, hence
+            // we could callibrate at different levels, hence keep a statevariable and only
+            // callibrate if this was the first loop iteration we were here this time around
+            if !last_was_lower {
+                let offset = -current_pos;
+                current_pos += offset;
+                target_pos += offset;
+                saved_pos += offset;
+                end_points.0 += offset;
+                end_points.1 += offset;
+                debug::debug("callibrated with offset", offset);
+            }
+            last_was_lower = true;
+            if let Some(v) = target_vel {
+                if v < 0 {
+                    target_vel = Some(0)
+                }
+            } else {
+                if target_pos < current_pos {
+                    target_pos = current_pos;
+                }
+            }
+            match state {
+                State::Oscillating(Direction::Down) => {
+                    state = State::Oscillating(Direction::Up);
+                    if end_points.0 < current_pos {
+                        end_points.0 = current_pos;
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            last_was_lower = false;
+        }
+        if is_upper {
+            if let Some(v) = target_vel {
+                if v < 0 {
+                    target_vel = Some(0)
+                }
+            } else {
+                if target_pos > current_pos {
+                    target_pos = current_pos;
+                }
+            }
+            match state {
+                State::Oscillating(Direction::Down) => {
+                    state = State::Oscillating(Direction::Up);
+                    if end_points.1 > current_pos {
+                        end_points.1 = current_pos;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Now we are at the stage where we actually should interact with the
+        // stepper enginge and see if we should send it any signals to move.
     }
 }
 
@@ -262,63 +351,13 @@ enum State {
     // motion of the spindle as a consequence of pressing the move buttons
     Manual,
     // In Oscillating mode the spindle will move periodically up and down
-    // between the two set-points (or end-points if hit before)
-    Oscillating,
+    // between the two set-points (or end-points if hit before). If true we
+    // are osciallating up
+    Oscillating(Direction),
 }
 
-enum SpindleTarget {
-    Position(i32), // Target position in steps
-    Velocity(i32), // Target velocity up or down
+#[derive(PartialEq, Eq)]
+enum Direction {
+    Up,
+    Down,
 }
-
-/*
-
-impl SposcillateApp {
-
-    pub fn main(&mut self) {
-        // Main application loop beeing run, not that since the stepper eninge is beeing controlled
-        // in this loop we cannot accept long delays anywhere (or we will get uneven moion)
-        loop {
-            self.handle_buttons();
-            self.update_display();
-
-        }
-    }
-
-    // We check the button state by polling the digital state of the corresponding input pins
-    fn handle_buttons(&mut self) {
-
-
-    if let Some(e) = self.buttons.run() {
-        use ButtonEvent::*;
-        use State::*;
-        match e {
-            Click(b_start_stop, m) => match self.state {
-                Started => self.state = Stopped,
-                Stopped => self.state = Started,
-            }
-            Click(b_up, m) => self.target_pos += 1,
-            Click(b_down, m) => self.target_pos -= 1,
-            TODO - REALLY WANT 1 PER BUTTON TO ENSURE ALL HANDLED!
-        }
-
-    }
-}
-}
-
-
- */
-
-/*
-
-void loop()
-{
-  currentMillis = millis();  //get the current "time" (actually the number of milliseconds since the program started)
-  if (currentMillis - startMillis >= period)  //test whether the period has elapsed
-  {
-    digitalWrite(ledPin, !digitalRead(ledPin));  //if so, change the state of the LED.  Uses a neat trick to change the state
-    startMillis = currentMillis;  //IMPORTANT to save the start time of the current LED state.
-  }
-}
-
-*/
